@@ -474,12 +474,15 @@ def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> D
 # -----------------------------
 # Report (RICE-ish, aggressive formatting)
 # -----------------------------
-def build_report(items: List[Dict]) -> Tuple[str, str]:
+
+def build_report(items: List[Dict]) -> Tuple[str, str, str]:
     now_kst = datetime.now(UTC).astimezone(KST)
     subject = f"[Daily Digest] {now_kst:%Y-%m-%d %H:%M} KST"
 
-    # Compute signals
+    # signals
     enriched = []
+    strength_rank = {"상": 3, "중": 2, "하": 1}
+
     for it in items:
         sig = analyze_signal(
             it.get("title", ""),
@@ -491,13 +494,12 @@ def build_report(items: List[Dict]) -> Tuple[str, str]:
         it2["signal"] = sig
         enriched.append(it2)
 
-    # Rank: prefer higher score + strength
-    strength_rank = {"상": 3, "중": 2, "하": 1}
+    # rank: strength then score
     enriched.sort(key=lambda x: (strength_rank.get(x["signal"]["strength"], 1), x.get("score", 0)), reverse=True)
 
     top3 = enriched[:3]
 
-    # Theme table: top per theme (limit 2)
+    # theme buckets
     theme_buckets: Dict[str, List[Dict]] = defaultdict(list)
     for it in enriched:
         for th in it.get("themes", ["기타"]):
@@ -511,125 +513,147 @@ def build_report(items: List[Dict]) -> Tuple[str, str]:
         best = theme_buckets[th][:2]
         if not best:
             continue
-        # compress news titles
         news_titles = " / ".join([b["title"][:55] + ("…" if len(b["title"]) > 55 else "") for b in best])
-        # overall signal for theme = max strength among best
-        max_strength = max(best, key=lambda x: strength_rank.get(x["signal"]["strength"], 1))["signal"]
-        theme_rows.append((th, news_titles, max_strength["risk_mode"], max_strength["stars"]))
+        max_sig = max(best, key=lambda x: strength_rank.get(x["signal"]["strength"], 1))["signal"]
+        theme_rows.append((th, news_titles, max_sig["risk_mode"], max_sig["stars"]))
 
-    # Keyword hits top 10
-    text_all = " ".join([(it.get("title", "") + " " + it.get("summary", "")).lower() for it in enriched])
-    hits = Counter()
-    for k in KEYWORDS.keys():
-        kk = k.lower()
-        if kk and kk in text_all:
-            hits[k] = text_all.count(kk)
-    hit_top = hits.most_common(10)
-
-    # Checklist (static, no APIs)
     checklist = [
         "프리마켓/선물: 나스닥 선물 방향",
         "미국채(10Y/2Y) 금리 급등/급락",
         "달러인덱스(DXY) & USD/KRW 갭",
         "WTI/Brent 유가 급등 여부",
-        "오늘 테마 로테이션: 반도체/AI vs 방산/정유 vs 은행",
-        "변동성: 장 초반 15분 '휩쏘' 경계",
+        "테마 로테이션: 반도체/AI vs 방산/정유 vs 은행",
+        "장 초반 15분 변동성(휩쏘) 경계",
     ]
 
-    # Build markdown-like text (email-friendly)
-    lines: List[str] = []
-    lines.append(f"📰 아침 단타용 경제뉴스 브리핑 (Rule-based, No LLM)")
-    lines.append(f"- 생성시각: {now_kst:%Y-%m-%d %H:%M} KST")
-    lines.append(f"- 수집창(Window): 최근 {RECENT_HOURS}시간")
-    lines.append(f"- Deduped + Scored items: {len(items)}")
-    lines.append("")
+    # --------
+    # TEXT (fallback)
+    # --------
+    t = []
+    t.append(f"Daily Digest ({now_kst:%Y-%m-%d %H:%M} KST) / Window: last {RECENT_HOURS}h / items: {len(items)}")
+    t.append("")
+    t.append("== Top 3 ==")
+    for i, it in enumerate(top3, 1):
+        sig = it["signal"]
+        ths = ", ".join(it.get("themes", ["기타"]))
+        title = it.get("title", "")
+        link = it.get("link", "")
+        t.append(f"{i}. [{sig['risk_mode']}/{sig['direction']}/{sig['strength']}{sig['stars']}] {title}")
+        t.append(f"   - themes: {ths} / score={it.get('score',0)} / hint: {THEME_HINTS.get(it.get('themes',['기타'])[0], THEME_HINTS['기타'])}")
+        t.append(f"   - action: {sig['trade_action']}")
+        t.append(f"   - {link}")
+        t.append("")
 
-    lines.append("R (Role) - 역할")
-    lines.append("- 당신은 10년 경력의 단기 트레이딩 전문가 (Rule-based 시그널)")
-    lines.append("")
-    lines.append("I (Instruction) - 지시사항")
-    lines.append("- 장 시작 전 단타 의사결정에 쓸 핵심 이슈/테마/리스크를 빠르게 요약")
-    lines.append("")
-    lines.append("C (Context) - 맥락")
-    lines.append("- 30~60분 내 빠른 판단 / 뉴스 → 테마/섹터/심리 연결")
-    lines.append("")
+    t.append("== Themes ==")
+    for row in theme_rows[:10]:
+        t.append(f"- {row[0]} | {row[2]} | {row[3]} | {row[1]}")
+    t.append("")
 
-    lines.append("📰 오늘의 핵심 뉴스 & 트레이딩 시그널 (Top 3)")
-    lines.append("---")
-    if not top3:
-        lines.append("(수집된 뉴스가 없습니다. RSS/GDELT 설정 또는 RECENT_HOURS/when:Nd를 점검하세요.)")
-    else:
-        for rank, it in enumerate(top3, 1):
-            sig = it["signal"]
-            ths = ", ".join(it.get("themes", ["기타"]))
-            dt_str = safe_dt_to_str(it.get("dt"))
-            src = it.get("source", "")
-            title = it.get("title", "")
-            link = it.get("link", "")
-            summary = it.get("summary", "")
-            if summary:
-                summary_line = summary[:160] + ("…" if len(summary) > 160 else "")
-            else:
-                summary_line = "(요약 없음)"
-
-            lines.append(f"🔥 {rank}순위: {title}")
-            lines.append(f"| 항목 | 내용 |")
-            lines.append(f"|------|------|")
-            lines.append(f"| 뉴스 요약 | {summary_line} |")
-            lines.append(f"| 시장 영향 | {sig['risk_mode']} |")
-            lines.append(f"| 방향/강도 | {sig['direction']} , {sig['strength']} {sig['stars']} |")
-            lines.append(f"| 관련 테마 | {ths} |")
-            lines.append(f"| 테마 힌트 | {THEME_HINTS.get(it.get('themes', ['기타'])[0], THEME_HINTS['기타'])} |")
-            lines.append(f"| 매매 전략 | {sig['trade_action']} |")
-            lines.append(f"| 체크 키워드 | {', '.join(sig['hits']) if sig['hits'] else '-'} |")
-            lines.append(f"| 소스/시간 | {src} {(' / ' + dt_str) if dt_str else ''} |")
-            lines.append(f"| 링크 | {link} |")
-            lines.append("---")
-
-    lines.append("")
-    lines.append("📊 테마별 정리 (Top)")
-    lines.append("| 테마 | 관련 뉴스(Top) | 시그널 | 강도 |")
-    lines.append("|------|--------------|--------|------|")
-    if theme_rows:
-        for th, news_titles, sig_mode, stars in theme_rows[:10]:
-            lines.append(f"| {th} | {news_titles} | {sig_mode} | {stars} |")
-    else:
-        lines.append("| (없음) |  |  |  |")
-
-    lines.append("")
-    lines.append("⚠️ 리스크 체크(오늘 장에서 특히)")
-    lines.append("- 국채금리 급등(=yields↑) 시: 성장주/나스닥 변동성↑")
-    lines.append("- 달러강세/원화약세 시: 수입원가/내수 부담, 수출/달러매출 상대 수혜")
-    lines.append("- 유가 급등/지정학 악화 시: 인플레 재점화 우려 → Risk-off")
-    lines.append("")
-
-    lines.append("✅ 오늘의 단타 체크리스트")
+    t.append("== Checklist ==")
     for c in checklist:
-        lines.append(f"- [ ] {c}")
-    lines.append("")
+        t.append(f"- [ ] {c}")
+    t.append("")
 
-    lines.append("🔎 키워드 히트 Top 10")
-    if hit_top:
-        lines.append(", ".join([f"{k}({c})" for k, c in hit_top]))
-    else:
-        lines.append("(no keyword hits)")
-    lines.append("")
-
-    # Also include compact "overall list" (Top 10) for browsing
-    lines.append("🧾 참고: 전체 상위 헤드라인 Top 10")
-    lines.append("---")
+    t.append("== Top 10 (browse) ==")
     for i, it in enumerate(enriched[:10], 1):
         sig = it["signal"]
-        src = it.get("source", "")
-        dt_str = safe_dt_to_str(it.get("dt"))
-        lines.append(f"{i:02d}. [{sig['risk_mode']}/{sig['direction']}/{sig['strength']}{sig['stars']}] {it.get('title','')}")
-        lines.append(f"    - themes: {', '.join(it.get('themes', ['기타']))} / score={it.get('score',0)} / {src}{(' / '+dt_str) if dt_str else ''}")
-        lines.append(f"    - {it.get('link','')}")
-    lines.append("")
+        title = it.get("title", "")
+        link = it.get("link", "")
+        t.append(f"{i:02d}. [{sig['risk_mode']}/{sig['direction']}/{sig['strength']}{sig['stars']}] {title} ({link})")
 
-    body = "\n".join(lines)
-    return subject, body
+    text_body = "\n".join(t)
 
+    # --------
+    # HTML (primary)
+    # --------
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    html = []
+    html.append("<html><body style='font-family: -apple-system, Segoe UI, Roboto, Arial; font-size: 14px;'>")
+    html.append(f"<div style='color:#666;margin-bottom:10px;'>Generated: {now_kst:%Y-%m-%d %H:%M} KST · Window: last {RECENT_HOURS}h · items: {len(items)}</div>")
+
+    html.append("<h2 style='margin:14px 0 8px;'>📰 Top 3</h2>")
+
+    for i, it in enumerate(top3, 1):
+        sig = it["signal"]
+        ths = ", ".join(it.get("themes", ["기타"]))
+        title = esc(it.get("title", ""))
+        link = it.get("link", "")
+        summary = esc(it.get("summary", "") or "(요약 없음)")
+        hint = esc(THEME_HINTS.get(it.get("themes", ["기타"])[0], THEME_HINTS["기타"]))
+        hits = esc(", ".join(sig["hits"]) if sig.get("hits") else "-")
+        src = esc(it.get("source", ""))
+        dt_str = esc(safe_dt_to_str(it.get("dt")))
+
+        html.append(f"<h3 style='margin:12px 0 6px;'>🔥 {i}순위: <a href='{link}'>{title}</a></h3>")
+        html.append("<table style='border-collapse:collapse;width:100%;max-width:900px;'>")
+
+        def tr(k, v):
+            html.append(
+                "<tr>"
+                f"<td style='border:1px solid #ddd;padding:8px;background:#fafafa;width:140px;vertical-align:top;'><b>{k}</b></td>"
+                f"<td style='border:1px solid #ddd;padding:8px;vertical-align:top;'>{v}</td>"
+                "</tr>"
+            )
+
+        tr("뉴스 요약", summary[:220] + ("…" if len(summary) > 220 else ""))
+        tr("시장 영향", esc(sig["risk_mode"]))
+        tr("방향/강도", f"{esc(sig['direction'])} · {esc(sig['strength'])} {esc(sig['stars'])}")
+        tr("관련 테마", esc(ths))
+        tr("테마 힌트", hint)
+        tr("매매 전략", esc(sig["trade_action"]))
+        tr("체크 키워드", hits)
+        tr("소스/시간", f"{src}{(' / ' + dt_str) if dt_str else ''}")
+
+        html.append("</table>")
+
+    # Theme table
+    html.append("<h2 style='margin:18px 0 8px;'>📊 Themes</h2>")
+    html.append("<table style='border-collapse:collapse;width:100%;max-width:900px;'>")
+    html.append(
+        "<tr>"
+        "<th style='border:1px solid #ddd;padding:8px;background:#f3f3f3;text-align:left;'>테마</th>"
+        "<th style='border:1px solid #ddd;padding:8px;background:#f3f3f3;text-align:left;'>관련 뉴스(Top)</th>"
+        "<th style='border:1px solid #ddd;padding:8px;background:#f3f3f3;text-align:left;'>시그널</th>"
+        "<th style='border:1px solid #ddd;padding:8px;background:#f3f3f3;text-align:left;'>강도</th>"
+        "</tr>"
+    )
+    for th, news_titles, sig_mode, stars in theme_rows[:10]:
+        html.append(
+            "<tr>"
+            f"<td style='border:1px solid #ddd;padding:8px;'>{esc(th)}</td>"
+            f"<td style='border:1px solid #ddd;padding:8px;'>{esc(news_titles)}</td>"
+            f"<td style='border:1px solid #ddd;padding:8px;'>{esc(sig_mode)}</td>"
+            f"<td style='border:1px solid #ddd;padding:8px;'>{esc(stars)}</td>"
+            "</tr>"
+        )
+    html.append("</table>")
+
+    # Checklist
+    html.append("<h2 style='margin:18px 0 8px;'>✅ Checklist</h2>")
+    html.append("<ul>")
+    for c in checklist:
+        html.append(f"<li>{esc(c)}</li>")
+    html.append("</ul>")
+
+    # Top 10 list with title-linked
+    html.append("<h2 style='margin:18px 0 8px;'>🧾 Top 10 (browse)</h2>")
+    html.append("<ol>")
+    for it in enriched[:10]:
+        sig = it["signal"]
+        title = esc(it.get("title", ""))
+        link = it.get("link", "")
+        html.append(
+            f"<li>[{esc(sig['risk_mode'])}/{esc(sig['direction'])}/{esc(sig['strength'])}{esc(sig['stars'])}] "
+            f"<a href='{link}'>{title}</a></li>"
+        )
+    html.append("</ol>")
+
+    html.append("</body></html>")
+    html_body = "\n".join(html)
+
+    return subject, text_body, html_body
 
 # -----------------------------
 # Delivery: Slack + Email(SMTP)
@@ -723,10 +747,10 @@ def main():
     ranked = dedupe_score(items, top_n=60)
 
     # Report
-    subject, body = build_report(ranked)
+    subject, text_body, html_body = build_report(ranked)
 
     # Local output (for logs)
-    print(body)
+    print(text_body)
     print("\nDone:", subject)
 
     # Deliver
@@ -738,7 +762,8 @@ def main():
 
     if smtp_host and smtp_user and smtp_pass and mail_from and mail_to:
         try:
-            send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_pass, mail_from, mail_to, subject, body)
+            send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_pass,
+                mail_from, mail_to, subject, text_body, html_body)
         except Exception as e:
             print(f"[WARN] Email send failed: {e}")
 
