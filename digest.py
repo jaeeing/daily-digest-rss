@@ -1,19 +1,24 @@
 # digest.py
 # Daily Economic Headline Digest (No LLM)
 # - RSS(Google News) + GDELT 수집
-# - 중복 제거 + 키워드 스코어링
+# - 중복 제거 + 키워드 점수화
 # - Rule-based "단타용" 시그널(방향/강도/Risk-on/off/액션) 분석
-# - 이메일(SMTP) / 슬랙(Webhook) 전송
+# - HTML 이메일(SMTP)로 표 렌더링 + 제목에 링크 포함
+# - (옵션) Slack(Webhook)
 #
-# Recommended env (local / GitHub Actions):
+# Env examples:
 #   USE_RSS=1
 #   GDELT_MAX=50
 #   RSS_MAX=80
 #   RECENT_HOURS=72
 #   ALLOW_UNDATED_RSS=1
+#   RAW_PREVIEW=0
 #   DEBUG_RSS_N=0
 #
-# SMTP (NAVER typically):
+# HTML preview (local):
+#   WRITE_HTML=1  -> writes preview.html
+#
+# SMTP (NAVER typical):
 #   SMTP_HOST=smtp.naver.com
 #   SMTP_PORT=465
 #   SMTP_USER=...
@@ -40,40 +45,28 @@ from typing import List, Dict, Tuple, Optional
 import requests
 import feedparser
 
-
 # -----------------------------
 # Timezones
 # -----------------------------
 KST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
-# Recent window (default 72h is more robust for Google News RSS)
 RECENT_HOURS = int(os.getenv("RECENT_HOURS", "72"))
-
-# RSS: include undated items if True (prevents "0 items" when feeds omit dates)
 ALLOW_UNDATED_RSS = os.getenv("ALLOW_UNDATED_RSS", "1") == "1"
-
-# Debug: show N RSS samples per feed (0 disables)
 DEBUG_RSS_N = int(os.getenv("DEBUG_RSS_N", "0"))
-
-# Raw preview: print first N collected raw items (0 disables)
 RAW_PREVIEW = int(os.getenv("RAW_PREVIEW", "0"))
 
-
 # -----------------------------
-# RSS Feeds
-# - Use when:3d to bias toward recent items in Google News search RSS
+# RSS Feeds (Google News)
+# - Use when:3d to bias toward recent items
 # -----------------------------
 RSS_FEEDS = [
-    # KR
     "https://news.google.com/rss/search?q=%EA%B8%88%EB%A6%AC%20%EC%97%B0%EC%A4%80%20%ED%99%98%EC%9C%A8%20%EB%AC%BC%EA%B0%80%20when%3A3d&hl=ko&gl=KR&ceid=KR:ko",
-    # US/EN
     "https://news.google.com/rss/search?q=nasdaq%20fed%20inflation%20yield%20when%3A3d&hl=en&gl=US&ceid=US:en",
 ]
 
-
 # -----------------------------
-# Keyword scoring (simple)
+# Keyword scoring
 # -----------------------------
 KEYWORDS = {
     # Macro / rates
@@ -108,7 +101,6 @@ THEMES = {
     "지정학/원자재": ["지정학", "geopolitics", "전쟁", "war", "제재", "sanction", "유가", "oil", "wti", "brent", "원자재", "commodities"],
 }
 
-# Sector/asset hints (not stock picks; just trading map)
 THEME_HINTS = {
     "금리/연준/물가": "성장주(나스닥)/채권(가격)/은행(순이자마진) 로테이션",
     "환율/달러/국채": "달러강세: 수출/달러매출↑, 수입원가/내수 부담",
@@ -118,7 +110,6 @@ THEME_HINTS = {
     "지정학/원자재": "유가/지정학: 정유/방산↑, 항공/운송 부담",
     "기타": "단기 이벤트성/개별 이슈",
 }
-
 
 # -----------------------------
 # Utils
@@ -181,26 +172,22 @@ def safe_dt_to_str(dt: Optional[datetime]) -> str:
 # RSS datetime extraction (robust)
 # -----------------------------
 def get_entry_datetime(e) -> Optional[datetime]:
-    # published string
     if hasattr(e, "published"):
         try:
             return parsedate_to_datetime(e.published)
         except Exception:
             pass
-    # updated string
     if hasattr(e, "updated"):
         try:
             return parsedate_to_datetime(e.updated)
         except Exception:
             pass
-    # published_parsed (struct_time)
     pp = getattr(e, "published_parsed", None)
     if pp:
         try:
             return datetime(*pp[:6], tzinfo=UTC)
         except Exception:
             pass
-    # updated_parsed (struct_time)
     up = getattr(e, "updated_parsed", None)
     if up:
         try:
@@ -219,7 +206,6 @@ def fetch_rss_items(urls: List[str], max_total: int) -> List[Dict]:
         feed = feedparser.parse(url)
         entries = getattr(feed, "entries", []) or []
 
-        # debug header
         if DEBUG_RSS_N > 0:
             print(f"[RSS] url={url}")
             print(f"[RSS] entries={len(entries)} bozo={getattr(feed,'bozo',None)} status={getattr(feed,'status',None)}")
@@ -228,15 +214,14 @@ def fetch_rss_items(urls: List[str], max_total: int) -> List[Dict]:
 
         for idx, e in enumerate(entries, 1):
             title = norm(getattr(e, "title", ""))
-            link = norm(getattr(e, "link", ""))  # Google News RSS link is usually here
+            link = norm(getattr(e, "link", ""))
             summary = norm(getattr(e, "summary", ""))
 
-            # fallback link from links[]
             if (not link) and hasattr(e, "links") and e.links:
                 try:
                     link = norm(e.links[0].get("href", ""))
                 except Exception:
-                    link = link
+                    pass
 
             if DEBUG_RSS_N > 0 and idx <= DEBUG_RSS_N:
                 print(f"[RSS][sample {idx}] title={title[:100]}")
@@ -260,7 +245,7 @@ def fetch_rss_items(urls: List[str], max_total: int) -> List[Dict]:
                 "link": link,
                 "summary": summary,
                 "source": "Google News RSS",
-                "dt": dt,  # store datetime object
+                "dt": dt,
             })
 
             if len(items) >= max_total:
@@ -277,10 +262,6 @@ def gdelt_dt(dt_utc: datetime) -> str:
 
 
 def fetch_gdelt_last_hours(query: str, max_records: int) -> List[Dict]:
-    """
-    GDELT DOC 2.0 (ArtList)
-    - start/end datetime already filters time window; avoid extra seendate parsing filters (can cause 0 items)
-    """
     base = "https://api.gdeltproject.org/api/v2/doc/doc"
     end = datetime.utcnow()
     start = end - timedelta(hours=RECENT_HOURS)
@@ -317,7 +298,6 @@ def fetch_gdelt_last_hours(query: str, max_records: int) -> List[Dict]:
         if not title or not link:
             continue
 
-        # seendate may be string like YYYYMMDDHHMMSS
         dt = None
         sd = norm(a.get("seendate", ""))
         if sd.isdigit() and len(sd) >= 14:
@@ -330,7 +310,7 @@ def fetch_gdelt_last_hours(query: str, max_records: int) -> List[Dict]:
             "id": stable_id(title, link),
             "title": title,
             "link": link,
-            "summary": "",  # ArtList often lacks summary
+            "summary": "",
             "source": norm(a.get("domain", "")) or "GDELT",
             "dt": dt,
         })
@@ -393,7 +373,6 @@ DIRECTION_DOWN_TERMS = ["hike", "hawkish", "hot inflation", "yields surge", "bon
 def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> Dict:
     text = f"{title} {summary}".lower()
 
-    # risk mode
     risk_off = any(t in text for t in RISK_OFF_TERMS)
     risk_on = any(t in text for t in RISK_ON_TERMS)
     if risk_off and not risk_on:
@@ -401,13 +380,11 @@ def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> D
     elif risk_on and not risk_off:
         risk_mode = "Risk-on"
     else:
-        # fallback: rates/war/oil tends to risk-off
         if any(k in text for k in ["hawkish", "yield", "war", "attack", "sanction", "oil", "inflation"]):
             risk_mode = "Risk-off"
         else:
             risk_mode = "Mixed"
 
-    # direction
     down = any(t in text for t in DIRECTION_DOWN_TERMS)
     up = any(t in text for t in DIRECTION_UP_TERMS)
     if up and not down:
@@ -417,16 +394,14 @@ def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> D
     else:
         direction = "→"
 
-    # strength (stars)
     strength_score = 0
-    strength_score += min(6, score)  # keyword score contributes
+    strength_score += min(6, score)
 
     if any(t in text for t in STRONG_TERMS):
         strength_score += 4
     elif any(t in text for t in MEDIUM_TERMS):
         strength_score += 2
 
-    # theme emphasis
     if any(t in themes for t in ["금리/연준/물가", "환율/달러/국채", "지정학/원자재"]):
         strength_score += 2
 
@@ -440,7 +415,6 @@ def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> D
         strength = "하"
         stars = "⭐"
 
-    # trade action
     if strength == "상" and direction in ("↑", "↓"):
         trade_action = "시초가 관찰 후 5~15분 눌림목/반등 시도"
     elif strength == "중":
@@ -448,11 +422,6 @@ def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> D
     else:
         trade_action = "관심등록(관망)"
 
-    # 1-line summary (rule-based)
-    theme_tag = themes[0] if themes else "기타"
-    one_liner = f"{theme_tag} 이슈 → {risk_mode}, 방향 {direction}, 강도 {strength}"
-
-    # keyword hits (top few keywords present)
     hits = []
     for k in KEYWORDS.keys():
         if k.lower() in text:
@@ -466,20 +435,17 @@ def analyze_signal(title: str, summary: str, themes: List[str], score: int) -> D
         "strength": strength,
         "stars": stars,
         "trade_action": trade_action,
-        "one_liner": one_liner,
         "hits": hits,
     }
 
 
 # -----------------------------
-# Report (RICE-ish, aggressive formatting)
+# Report (HTML + TEXT)
 # -----------------------------
-
 def build_report(items: List[Dict]) -> Tuple[str, str, str]:
     now_kst = datetime.now(UTC).astimezone(KST)
     subject = f"[Daily Digest] {now_kst:%Y-%m-%d %H:%M} KST"
 
-    # signals
     enriched = []
     strength_rank = {"상": 3, "중": 2, "하": 1}
 
@@ -494,12 +460,10 @@ def build_report(items: List[Dict]) -> Tuple[str, str, str]:
         it2["signal"] = sig
         enriched.append(it2)
 
-    # rank: strength then score
     enriched.sort(key=lambda x: (strength_rank.get(x["signal"]["strength"], 1), x.get("score", 0)), reverse=True)
 
     top3 = enriched[:3]
 
-    # theme buckets
     theme_buckets: Dict[str, List[Dict]] = defaultdict(list)
     for it in enriched:
         for th in it.get("themes", ["기타"]):
@@ -526,9 +490,7 @@ def build_report(items: List[Dict]) -> Tuple[str, str, str]:
         "장 초반 15분 변동성(휩쏘) 경계",
     ]
 
-    # --------
-    # TEXT (fallback)
-    # --------
+    # TEXT fallback
     t = []
     t.append(f"Daily Digest ({now_kst:%Y-%m-%d %H:%M} KST) / Window: last {RECENT_HOURS}h / items: {len(items)}")
     t.append("")
@@ -548,12 +510,10 @@ def build_report(items: List[Dict]) -> Tuple[str, str, str]:
     for row in theme_rows[:10]:
         t.append(f"- {row[0]} | {row[2]} | {row[3]} | {row[1]}")
     t.append("")
-
     t.append("== Checklist ==")
     for c in checklist:
         t.append(f"- [ ] {c}")
     t.append("")
-
     t.append("== Top 10 (browse) ==")
     for i, it in enumerate(enriched[:10], 1):
         sig = it["signal"]
@@ -563,18 +523,15 @@ def build_report(items: List[Dict]) -> Tuple[str, str, str]:
 
     text_body = "\n".join(t)
 
-    # --------
-    # HTML (primary)
-    # --------
+    # HTML primary
     def esc(s: str) -> str:
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     html = []
-    html.append("<html><body style='font-family: -apple-system, Segoe UI, Roboto, Arial; font-size: 14px;'>")
+    html.append("<html><body style='font-family:-apple-system,Segoe UI,Roboto,Arial;font-size:14px;'>")
     html.append(f"<div style='color:#666;margin-bottom:10px;'>Generated: {now_kst:%Y-%m-%d %H:%M} KST · Window: last {RECENT_HOURS}h · items: {len(items)}</div>")
 
     html.append("<h2 style='margin:14px 0 8px;'>📰 Top 3</h2>")
-
     for i, it in enumerate(top3, 1):
         sig = it["signal"]
         ths = ", ".join(it.get("themes", ["기타"]))
@@ -608,7 +565,6 @@ def build_report(items: List[Dict]) -> Tuple[str, str, str]:
 
         html.append("</table>")
 
-    # Theme table
     html.append("<h2 style='margin:18px 0 8px;'>📊 Themes</h2>")
     html.append("<table style='border-collapse:collapse;width:100%;max-width:900px;'>")
     html.append(
@@ -630,30 +586,26 @@ def build_report(items: List[Dict]) -> Tuple[str, str, str]:
         )
     html.append("</table>")
 
-    # Checklist
     html.append("<h2 style='margin:18px 0 8px;'>✅ Checklist</h2>")
     html.append("<ul>")
     for c in checklist:
         html.append(f"<li>{esc(c)}</li>")
     html.append("</ul>")
 
-    # Top 10 list with title-linked
     html.append("<h2 style='margin:18px 0 8px;'>🧾 Top 10 (browse)</h2>")
     html.append("<ol>")
     for it in enriched[:10]:
         sig = it["signal"]
         title = esc(it.get("title", ""))
         link = it.get("link", "")
-        html.append(
-            f"<li>[{esc(sig['risk_mode'])}/{esc(sig['direction'])}/{esc(sig['strength'])}{esc(sig['stars'])}] "
-            f"<a href='{link}'>{title}</a></li>"
-        )
+        html.append(f"<li>[{esc(sig['risk_mode'])}/{esc(sig['direction'])}/{esc(sig['strength'])}{esc(sig['stars'])}] <a href='{link}'>{title}</a></li>")
     html.append("</ol>")
 
     html.append("</body></html>")
     html_body = "\n".join(html)
 
     return subject, text_body, html_body
+
 
 # -----------------------------
 # Delivery: Slack + Email(SMTP)
@@ -667,16 +619,15 @@ def send_slack(webhook_url: str, text: str) -> None:
 
 
 def send_email_smtp(host: str, port: int, user: str, pw: str,
-                    mail_from: str, mail_to: str, subject: str, body: str) -> None:
-    """
-    - 465: SMTP_SSL
-    - 587: STARTTLS
-    """
-    msg = MIMEMultipart()
+                    mail_from: str, mail_to: str, subject: str,
+                    text_body: str, html_body: str) -> None:
+    msg = MIMEMultipart("alternative")
     msg["From"] = mail_from
     msg["To"] = mail_to
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     if port == 465:
         with smtplib.SMTP_SSL(host, port, timeout=30) as s:
@@ -696,12 +647,10 @@ def send_email_smtp(host: str, port: int, user: str, pw: str,
 # Main
 # -----------------------------
 def main():
-    # Collection toggles
     use_rss = os.getenv("USE_RSS", "1") == "1"
     gdelt_max = int(os.getenv("GDELT_MAX", "50"))
     rss_max = int(os.getenv("RSS_MAX", "80"))
 
-    # GDELT query (OR terms must be wrapped with parentheses in GDELT)
     gdelt_query = os.getenv(
         "GDELT_QUERY",
         "rate OR fed OR inflation OR fx OR dollar OR bond OR treasury OR yield OR nasdaq OR semiconductor OR ai OR recession OR jobs OR pmi OR china OR geopolitics OR oil"
@@ -709,11 +658,10 @@ def main():
     if " OR " in gdelt_query and not gdelt_query.startswith("("):
         gdelt_query = f"({gdelt_query})"
 
-    # Delivery options
     slack_webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
     smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "465"))  # NAVER default
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
     smtp_pass = os.getenv("SMTP_PASS", "").strip()
     mail_from = os.getenv("MAIL_FROM", "").strip()
@@ -721,21 +669,18 @@ def main():
 
     items: List[Dict] = []
 
-    # 1) GDELT
     if gdelt_max > 0:
         try:
             items += fetch_gdelt_last_hours(gdelt_query, gdelt_max)
         except Exception as e:
             print(f"[WARN] GDELT fetch failed: {e}")
 
-    # 2) RSS
     if use_rss:
         try:
             items += fetch_rss_items(RSS_FEEDS, rss_max)
         except Exception as e:
             print(f"[WARN] RSS fetch failed: {e}")
 
-    # RAW preview
     if RAW_PREVIEW > 0:
         print(f"\n[RAW] collected items = {len(items)} (GDELT={'on' if gdelt_max>0 else 'off'}, RSS={'on' if use_rss else 'off'})")
         for i, it in enumerate(items[:RAW_PREVIEW], 1):
@@ -743,27 +688,31 @@ def main():
             print(f"{i:02d}. {it.get('title','')} [{it.get('source','')}] {dt_str}")
             print(f"    {it.get('link','')}")
 
-    # Dedupe + score
     ranked = dedupe_score(items, top_n=60)
 
-    # Report
     subject, text_body, html_body = build_report(ranked)
 
-    # Local output (for logs)
+    # Local preview
+    if os.getenv("WRITE_HTML", "0") == "1":
+        with open("preview.html", "w", encoding="utf-8") as f:
+            f.write(html_body)
+        print("[OK] wrote preview.html")
+
     print(text_body)
     print("\nDone:", subject)
 
-    # Deliver
     if slack_webhook:
         try:
-            send_slack(slack_webhook, body)
+            send_slack(slack_webhook, text_body)
         except Exception as e:
             print(f"[WARN] Slack send failed: {e}")
 
     if smtp_host and smtp_user and smtp_pass and mail_from and mail_to:
         try:
-            send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_pass,
-                mail_from, mail_to, subject, text_body, html_body)
+            send_email_smtp(
+                smtp_host, smtp_port, smtp_user, smtp_pass,
+                mail_from, mail_to, subject, text_body, html_body
+            )
         except Exception as e:
             print(f"[WARN] Email send failed: {e}")
 
