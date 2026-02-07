@@ -1,7 +1,7 @@
 name: Daily Digest Email
 
-on:
-  workflow_dispatch:
+"on":
+  workflow_dispatch: {}
   schedule:
     # KST 07:30 = UTC 22:30 (전날)
     - cron: "30 22 * * *"
