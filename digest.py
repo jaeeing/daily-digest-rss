@@ -455,7 +455,7 @@ def main():
     # Slack/Email (optional)
     slack_webhook = os.getenv("SLACK_WEBHOOK_URL", "").strip()
     smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
     smtp_pass = os.getenv("SMTP_PASS", "").strip()
     mail_from = os.getenv("MAIL_FROM", "").strip()
